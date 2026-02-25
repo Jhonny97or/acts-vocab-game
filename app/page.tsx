@@ -1,39 +1,123 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+type Verse = { v: number; t: string };
+type ActsData = Record<string, Verse[]>; // "1".."28"
 
 type ClickResult = "ok" | "bad";
 
-/** Normaliza Unicode para estabilidad */
-function nfc(s: string) {
-  return (s ?? "").normalize("NFC");
-}
-
-/**
- * Clave de comparación:
- * - lower
- * - NFD
- * - quita diacríticos (combining marks)
- * - vuelve a NFC
- *
- * Así: ειπεν == εἶπεν
- */
-function keyNoAccents(s: string) {
-  return nfc(s)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}+/gu, "") // diacríticos
-    .normalize("NFC")
+function cleanText(s: string) {
+  return s
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-/** Tokenizador: preserva separadores para render “tal cual” */
+function normalizeNFC(s: string) {
+  return s.normalize("NFC");
+}
+
+function stripDiacritics(s: string) {
+  return s.normalize("NFD").replace(/\p{M}+/gu, "").normalize("NFC");
+}
+
+function normalizeForCompare(s: string, ignoreAccents: boolean) {
+  const n = normalizeNFC(s);
+  return ignoreAccents ? stripDiacritics(n) : n;
+}
+
+/**
+ * Extrae versículos desde el HTML de die-bibel.
+ * Estrategia principal: buscar <sup>NUM</sup> (número de verso) y tomar el texto hasta el siguiente sup.
+ * Si cambian el HTML, normalmente solo ajustas esta función.
+ */
+function extractVersesFromHtml(html: string): Verse[] {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const body = doc.body;
+  if (!body) return [];
+
+  function isVerseSup(el: Element) {
+    if (el.tagName.toLowerCase() !== "sup") return false;
+    const n = cleanText(el.textContent || "");
+    return /^\d{1,3}$/.test(n);
+  }
+
+  function nextNode(start: Node | null): Node | null {
+    if (!start) return null;
+    if ((start as any).firstChild) return (start as any).firstChild;
+    let n: any = start;
+    while (n) {
+      if (n.nextSibling) return n.nextSibling;
+      n = n.parentNode;
+    }
+    return null;
+  }
+
+  function collectTextUntilNextSup(sup: Element) {
+    const texts: string[] = [];
+    let node: Node | null = nextNode(sup);
+
+    while (node) {
+      if (node.nodeType === 1 && isVerseSup(node as Element)) break;
+
+      if (node.nodeType === 3) {
+        const tx = cleanText(node.nodeValue || "");
+        if (tx) texts.push(tx);
+      } else if (node.nodeType === 1) {
+        const el = node as Element;
+        // evita duplicar grandes contenedores
+        if (el.children.length === 0) {
+          const tx = cleanText(el.textContent || "");
+          if (tx) texts.push(tx);
+        }
+      }
+      node = nextNode(node);
+    }
+
+    return cleanText(texts.join(" "));
+  }
+
+  const sups = Array.from(doc.querySelectorAll("sup")).filter(isVerseSup);
+  const verses: Verse[] = [];
+
+  if (sups.length > 0) {
+    for (const sup of sups) {
+      const v = parseInt(cleanText(sup.textContent || ""), 10);
+      const t = collectTextUntilNextSup(sup);
+      if (Number.isFinite(v) && t) verses.push({ v, t });
+    }
+  }
+
+  // fallback (menos confiable)
+  if (verses.length === 0) {
+    const raw = cleanText(body.textContent || "");
+    const parts = raw.split(/\s(?=\d{1,3}\s)/g);
+    for (const p of parts) {
+      const m = p.match(/^(\d{1,3})\s+(.*)$/);
+      if (!m) continue;
+      verses.push({ v: parseInt(m[1], 10), t: cleanText(m[2]) });
+    }
+  }
+
+  // dedup + sort
+  const seen = new Set<string>();
+  const out: Verse[] = [];
+  for (const x of verses) {
+    const key = `${x.v}|${x.t.slice(0, 40)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(x);
+  }
+  out.sort((a, b) => a.v - b.v);
+  return out;
+}
+
+// tokeniza texto griego preservando separadores
 function tokenizePreserve(text: string): Array<{ kind: "word" | "sep"; value: string }> {
-  // palabra = letras + diacríticos; separador = lo demás
   const re = /([\p{L}\p{M}]+)|([^\p{L}\p{M}]+)/gu;
   const out: Array<{ kind: "word" | "sep"; value: string }> = [];
   let m: RegExpExecArray | null;
-
   while ((m = re.exec(text)) !== null) {
     const word = m[1];
     const sep = m[2];
@@ -71,144 +155,248 @@ const DEFAULT_MISSION = [
   "νυν"
 ];
 
+function todayKey() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 export default function Page() {
-  const [rawText, setRawText] = useState<string>("");
-  const [loading, setLoading] = useState(true);
+  // --------- MODE: NA28 (online) o TXT local -----------
+  const [mode, setMode] = useState<"na28" | "txt">("na28");
 
-  // misión editable (1 palabra por línea)
-  const [missionText, setMissionText] = useState<string>(DEFAULT_MISSION.join("\n"));
+  // --------- NA28 data ----------
+  const [acts, setActs] = useState<ActsData | null>(null);
+  const [loadingActs, setLoadingActs] = useState(false);
+  const [status, setStatus] = useState<string>("");
+  const [chapter, setChapter] = useState<number>(1);
 
-  // filtros
-  const [search, setSearch] = useState("");
+  // --------- TXT local (opcional) ----------
+  const [rawText, setRawText] = useState("");
+  const [loadingTxt, setLoadingTxt] = useState(false);
+
+  // --------- Study settings ----------
+  const [ignoreAccents, setIgnoreAccents] = useState(true);
   const [onlyMission, setOnlyMission] = useState(false);
 
-  // opciones clave
-  const [ignoreAccents, setIgnoreAccents] = useState(true); // <-- default ON
-  const [lineMode, setLineMode] = useState(true); // modo “verso-like” por líneas
+  const [missionText, setMissionText] = useState(DEFAULT_MISSION.join("\n"));
+  const [search, setSearch] = useState("");
 
-  // feedback clic
-  const [lastClick, setLastClick] = useState<{ idx: number; result: ClickResult } | null>(null);
-
-  // contadores por palabra (guardamos por clave)
+  const [lastClick, setLastClick] = useState<{ key: string; result: ClickResult } | null>(null);
   const [foundCounts, setFoundCounts] = useState<Record<string, number>>({});
 
+  // --------- Refs para scroll a versículo ----------
+  const verseRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
+
+  // --------- Persistencia ----------
   useEffect(() => {
-    let isMounted = true;
-    async function load() {
-      try {
-        const res = await fetch("/acts_griego.txt", { cache: "no-store" });
-        const t = await res.text();
-        if (isMounted) setRawText(nfc(t));
-      } finally {
-        if (isMounted) setLoading(false);
+    try {
+      const saved = localStorage.getItem("acts_vocab_state_v2");
+      const savedDay = localStorage.getItem("acts_vocab_day_v2");
+
+      if (savedDay && savedDay !== todayKey()) {
+        localStorage.setItem("acts_vocab_day_v2", todayKey());
+        // reset solo progreso diario
+        // (misión se conserva)
+        const obj = saved ? JSON.parse(saved) : {};
+        obj.foundCounts = {};
+        localStorage.setItem("acts_vocab_state_v2", JSON.stringify(obj));
       }
-    }
-    load();
-    return () => {
-      isMounted = false;
-    };
+
+      if (saved) {
+        const obj = JSON.parse(saved);
+        if (obj.missionText) setMissionText(String(obj.missionText));
+        if (typeof obj.ignoreAccents === "boolean") setIgnoreAccents(obj.ignoreAccents);
+        if (typeof obj.onlyMission === "boolean") setOnlyMission(obj.onlyMission);
+        if (typeof obj.mode === "string") setMode(obj.mode);
+        if (typeof obj.chapter === "number") setChapter(obj.chapter);
+
+        if (savedDay === todayKey() && obj.foundCounts) setFoundCounts(obj.foundCounts);
+      }
+      if (!savedDay) localStorage.setItem("acts_vocab_day_v2", todayKey());
+    } catch {}
   }, []);
 
-  /**
-   * Misión:
-   * guardamos:
-   * - display: lo que el usuario escribió
-   * - key: clave (sin acentos si ignoreAccents)
-   */
-  const missionItems = useMemo(() => {
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "acts_vocab_state_v2",
+        JSON.stringify({ missionText, ignoreAccents, onlyMission, foundCounts, mode, chapter })
+      );
+      localStorage.setItem("acts_vocab_day_v2", localStorage.getItem("acts_vocab_day_v2") || todayKey());
+    } catch {}
+  }, [missionText, ignoreAccents, onlyMission, foundCounts, mode, chapter]);
+
+  // --------- Mission set ----------
+  const missionSet = useMemo(() => {
     const lines = missionText
       .split("\n")
-      .map((s) => s.trim())
+      .map((s) => normalizeForCompare(s.trim(), ignoreAccents))
       .filter(Boolean);
-
-    // quitamos duplicados por “clave”
-    const map = new Map<string, string>(); // key -> display
-    for (const w of lines) {
-      const k = ignoreAccents ? keyNoAccents(w) : nfc(w).toLowerCase();
-      if (!map.has(k)) map.set(k, w);
-    }
-    return Array.from(map.entries()).map(([key, display]) => ({ key, display }));
+    return new Set(lines);
   }, [missionText, ignoreAccents]);
 
-  const missionSet = useMemo(() => new Set(missionItems.map((x) => x.key)), [missionItems]);
-
-  const tokens = useMemo(() => tokenizePreserve(rawText), [rawText]);
-
-  // texto por líneas (para “capítulo/verso-like”)
-  const lines = useMemo(() => {
-    const ls = rawText.split(/\r?\n/);
-    // quitamos líneas vacías al inicio/fin, pero mantenemos las internas
-    return ls;
-  }, [rawText]);
-
-  const totalMissionFound = useMemo(() => Object.values(foundCounts).reduce((a, b) => a + b, 0), [foundCounts]);
+  const missionList = useMemo(() => Array.from(missionSet), [missionSet]);
 
   const missionProgress = useMemo(() => {
-    const done = missionItems.filter((w) => (foundCounts[w.key] || 0) > 0).length;
-    return { done, total: missionItems.length };
-  }, [foundCounts, missionItems]);
+    const done = missionList.filter((w) => (foundCounts[w] || 0) > 0).length;
+    return { done, total: missionList.length };
+  }, [foundCounts, missionList]);
+
+  const totalMissionFound = useMemo(
+    () => Object.values(foundCounts).reduce((a, b) => a + b, 0),
+    [foundCounts]
+  );
 
   function resetDay() {
     setFoundCounts({});
     setLastClick(null);
   }
 
-  function wordKey(word: string) {
-    return ignoreAccents ? keyNoAccents(word) : nfc(word).toLowerCase();
+  // --------- LOAD NA28 (cache localStorage) ----------
+  async function fetchChapterHtml(ch: number) {
+    const res = await fetch(`/api/na28?chapter=${ch}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`No pude bajar cap ${ch} (HTTP ${res.status})`);
+    return await res.text();
   }
 
-  function onWordClick(word: string, idx: number) {
-    const k = wordKey(word);
-    const ok = missionSet.has(k);
+  async function loadNA28(force = false) {
+    try {
+      setLoadingActs(true);
+      setStatus("Cargando NA28 Hechos (1–28)…");
 
-    setLastClick({ idx, result: ok ? "ok" : "bad" });
+      const key = "NA28_ACTS_JSON";
+      if (!force) {
+        const cached = localStorage.getItem(key);
+        if (cached) {
+          setActs(JSON.parse(cached));
+          setStatus("Listo (desde cache).");
+          return;
+        }
+      }
+
+      const data: ActsData = {};
+      for (let ch = 1; ch <= 28; ch++) {
+        setStatus(`Bajando cap ${ch}/28…`);
+        const html = await fetchChapterHtml(ch);
+        const verses = extractVersesFromHtml(html);
+        if (!verses.length) throw new Error(`Capítulo ${ch}: no pude extraer versículos (HTML cambió).`);
+        data[String(ch)] = verses;
+      }
+
+      localStorage.setItem(key, JSON.stringify(data));
+      setActs(data);
+      setStatus("Listo. Ya tienes capítulos y versículos.");
+    } catch (e: any) {
+      console.error(e);
+      setStatus("Error: " + (e?.message || String(e)));
+    } finally {
+      setLoadingActs(false);
+    }
+  }
+
+  // --------- TXT local ----------
+  async function loadTxt() {
+    setLoadingTxt(true);
+    try {
+      const res = await fetch("/acts_griego.txt", { cache: "no-store" });
+      const t = await res.text();
+      setRawText(t.normalize("NFC"));
+    } finally {
+      setLoadingTxt(false);
+    }
+  }
+
+  // Auto-load NA28 on first visit if mode na28
+  useEffect(() => {
+    if (mode === "na28" && !acts && !loadingActs) {
+      loadNA28(false);
+    }
+    if (mode === "txt" && !rawText && !loadingTxt) {
+      loadTxt();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // --------- SEARCH across NA28 ----------
+  const qNorm = useMemo(() => normalizeForCompare(search.trim(), ignoreAccents), [search, ignoreAccents]);
+
+  const searchResults = useMemo(() => {
+    if (mode !== "na28" || !acts || !qNorm) return [];
+    const out: Array<{ ch: number; v: number; t: string }> = [];
+    for (let ch = 1; ch <= 28; ch++) {
+      const verses = acts[String(ch)] || [];
+      for (const { v, t } of verses) {
+        const comp = normalizeForCompare(t, ignoreAccents);
+        if (comp.includes(qNorm)) out.push({ ch, v, t });
+      }
+    }
+    return out.slice(0, 200);
+  }, [mode, acts, qNorm, ignoreAccents]);
+
+  function scrollToVerse(ch: number, v: number) {
+    const id = `act-${ch}-${v}`;
+    const el = verseRefs.current.get(id);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function onWordClick(word: string, clickKey: string) {
+    const w = normalizeForCompare(word, ignoreAccents);
+    const ok = missionSet.has(w);
+
+    setLastClick({ key: clickKey, result: ok ? "ok" : "bad" });
 
     if (ok) {
       setFoundCounts((prev) => ({
         ...prev,
-        [k]: (prev[k] || 0) + 1
+        [w]: (prev[w] || 0) + 1
       }));
     }
 
     window.setTimeout(() => {
-      setLastClick((cur) => (cur?.idx === idx ? null : cur));
-    }, 350);
+      setLastClick((cur) => (cur?.key === clickKey ? null : cur));
+    }, 300);
   }
 
-  const filteredTokens = useMemo(() => {
-    const qRaw = search.trim();
-    const q = ignoreAccents ? keyNoAccents(qRaw) : nfc(qRaw).toLowerCase();
+  // --------- Render helpers ----------
+  function WordSpan({
+    word,
+    clickKey
+  }: {
+    word: string;
+    clickKey: string;
+  }) {
+    const isFlash = lastClick?.key === clickKey ? lastClick.result : null;
+    const className =
+      "token " +
+      (isFlash === "ok" ? "token-ok" : isFlash === "bad" ? "token-bad" : "");
 
-    if (!q && !onlyMission) return tokens;
+    return (
+      <span className={className} onClick={() => onWordClick(word, clickKey)} title="Click">
+        {word}
+      </span>
+    );
+  }
 
-    return tokens.filter((t) => {
-      if (t.kind === "sep") return !onlyMission;
-
-      const k = wordKey(t.value);
-
-      const passMission = !onlyMission || missionSet.has(k);
-      const passSearch = !q || k.includes(q);
-
-      return passMission && passSearch;
-    });
-  }, [tokens, search, onlyMission, missionSet, ignoreAccents]);
+  const hasActs = !!acts;
 
   return (
     <div className="container">
       <div className="header">
         <div>
           <div className="h1">Hechos — Juego de Vocabulario (Griego)</div>
-          <div className="sub">Clickea palabras. Verde = está en tu misión. Rojo = no está.</div>
+          <div className="sub">
+            Misión diaria + texto clickeable.{" "}
+            <b>{mode === "na28" ? "Modo NA28 (cap/verso)" : "Modo TXT local"}</b>
+          </div>
         </div>
 
         <div className="row">
-          <span className="badge">
-            Progreso: {missionProgress.done}/{missionProgress.total}
-          </span>
-          <span className="badge">Aciertos totales: {totalMissionFound}</span>
-          <button className="btn" onClick={resetDay}>
-            Reiniciar día
-          </button>
+          <span className="badge">Progreso: {missionProgress.done}/{missionProgress.total}</span>
+          <span className="badge">Aciertos: {totalMissionFound}</span>
+          <button className="btn" onClick={resetDay}>Reiniciar día</button>
         </div>
       </div>
 
@@ -217,8 +405,8 @@ export default function Page() {
         <div className="card">
           <div className="row" style={{ justifyContent: "space-between" }}>
             <div>
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>Misión del día</div>
-              <div className="small">1 palabra por línea (tal cual la ves en tu lista).</div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Misión del día</div>
+              <div className="small">1 palabra por línea. (Con “ignorar acentos” ON, escribe sin acentos).</div>
             </div>
           </div>
 
@@ -231,35 +419,84 @@ export default function Page() {
           </div>
 
           <div className="row" style={{ marginTop: 10 }}>
-            <button className="btn" onClick={() => setMissionText(DEFAULT_MISSION.join("\n"))}>
-              Cargar ejemplo (25)
-            </button>
-            <button className="btn" onClick={() => setMissionText("")}>
-              Limpiar
-            </button>
+            <button className="btn" onClick={() => setMissionText(DEFAULT_MISSION.join("\n"))}>Cargar ejemplo (25)</button>
+            <button className="btn" onClick={() => setMissionText("")}>Limpiar</button>
           </div>
 
-          <div className="row" style={{ marginTop: 12 }}>
+          <div className="row" style={{ marginTop: 10 }}>
             <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <input type="checkbox" checked={ignoreAccents} onChange={(e) => setIgnoreAccents(e.target.checked)} />
               <span className="small">Ignorar acentos (recomendado)</span>
             </label>
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input type="checkbox" checked={onlyMission} onChange={(e) => setOnlyMission(e.target.checked)} />
+              <span className="small">Modo “solo misión”</span>
+            </label>
           </div>
 
-          <div style={{ marginTop: 14, fontWeight: 700 }}>Marcador</div>
+          <div className="hr" />
+
+          <div style={{ fontWeight: 800 }}>Fuente de texto</div>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button className={"btn " + (mode === "na28" ? "btn-primary" : "")} onClick={() => setMode("na28")}>
+              NA28 (cap/verso)
+            </button>
+            <button className={"btn " + (mode === "txt" ? "btn-primary" : "")} onClick={() => setMode("txt")}>
+              TXT local
+            </button>
+          </div>
+
+          {mode === "na28" && (
+            <div style={{ marginTop: 10 }}>
+              <div className="row">
+                <button className="btn" disabled={loadingActs} onClick={() => loadNA28(false)}>
+                  {hasActs ? "Recargar (cache)" : "Cargar NA28"}
+                </button>
+                <button className="btn" disabled={loadingActs} onClick={() => loadNA28(true)}>
+                  Forzar descarga
+                </button>
+              </div>
+              <div className="small" style={{ marginTop: 6 }}>{status}</div>
+
+              <div className="row" style={{ marginTop: 10 }}>
+                <label>Capítulo</label>
+                <select
+                  value={chapter}
+                  onChange={(e) => setChapter(parseInt(e.target.value, 10))}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: 10,
+                    border: "1px solid var(--border)",
+                    background: "rgba(2, 6, 23, 0.6)",
+                    color: "var(--text)"
+                  }}
+                >
+                  {Array.from({ length: 28 }, (_, i) => i + 1).map((ch) => (
+                    <option key={ch} value={ch}>Hechos {ch}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+
+          {mode === "txt" && (
+            <div style={{ marginTop: 10 }}>
+              <button className="btn" disabled={loadingTxt} onClick={loadTxt}>Cargar TXT</button>
+              <div className="small" style={{ marginTop: 6 }}>
+                Archivo: <code>public/acts_griego.txt</code>
+              </div>
+            </div>
+          )}
+
+          <div className="hr" />
+
+          <div style={{ fontWeight: 800 }}>Marcador</div>
           <div className="small" style={{ marginTop: 4 }}>
-            Objetivo: que cada palabra tenga al menos 1 “found”.
+            Objetivo: que cada palabra de la misión tenga al menos 1 “found”.
           </div>
 
-          <div
-            style={{
-              marginTop: 10,
-              maxHeight: 260,
-              overflow: "auto",
-              border: "1px solid var(--border)",
-              borderRadius: 12
-            }}
-          >
+          <div style={{ marginTop: 10, maxHeight: 280, overflow: "auto", border: "1px solid var(--border)", borderRadius: 12 }}>
             <table className="table">
               <thead>
                 <tr>
@@ -268,19 +505,14 @@ export default function Page() {
                 </tr>
               </thead>
               <tbody>
-                {missionItems.map((w) => (
-                  <tr key={w.key}>
-                    <td style={{ fontFamily: "ui-serif, Georgia, serif" }}>{w.display}</td>
-                    <td>{foundCounts[w.key] || 0}</td>
+                {missionList.map((w) => (
+                  <tr key={w}>
+                    <td style={{ fontFamily: "ui-serif, Georgia, serif" }}>{w}</td>
+                    <td>{foundCounts[w] || 0}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </div>
-
-          <div className="small" style={{ marginTop: 10 }}>
-            Nota: tu <code>acts_griego.txt</code> no trae números de capítulo/verso. Por eso agregué “Modo líneas” (línea #).
-            Si luego me pasas un texto con versificación (1:1, 1:2…), lo actualizamos a capítulo/verso real.
           </div>
         </div>
 
@@ -288,27 +520,20 @@ export default function Page() {
         <div className="card">
           <div className="row" style={{ justifyContent: "space-between" }}>
             <div>
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>Texto (clickeable)</div>
-              <div className="small">
-                Archivo: <code>public/acts_griego.txt</code>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>
+                {mode === "na28" ? "Texto NA28 (cap/verso)" : "Texto (TXT)"}
               </div>
-            </div>
-
-            <div className="row">
-              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <input type="checkbox" checked={onlyMission} onChange={(e) => setOnlyMission(e.target.checked)} />
-                <span className="small">Mostrar solo misión</span>
-              </label>
-
-              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <input type="checkbox" checked={lineMode} onChange={(e) => setLineMode(e.target.checked)} />
-                <span className="small">Modo líneas</span>
-              </label>
+              <div className="small">
+                {mode === "na28"
+                  ? "Navega por capítulo/verso, y busca devolviendo Hechos 3:16 etc."
+                  : "Modo simple por texto pegado."
+                }
+              </div>
             </div>
           </div>
 
           <div style={{ marginTop: 10 }}>
-            <label>Buscar (si “ignorar acentos” está ON, puedes escribir sin acentos)</label>
+            <label>Buscar (si “ignorar acentos” ON, puedes escribir sin acentos)</label>
             <input
               type="text"
               value={search}
@@ -317,103 +542,105 @@ export default function Page() {
             />
           </div>
 
-          <div style={{ marginTop: 12 }} className="scroller">
-            {loading ? (
-              <div className="small">Cargando texto...</div>
-            ) : rawText.trim().length === 0 ? (
-              <div className="small">
-                No se encontró texto. Verifica que exista <code>public/acts_griego.txt</code>.
+          {mode === "na28" && qNorm && (
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ marginBottom: 6 }}>
+                Resultados (click para saltar)
               </div>
-            ) : lineMode ? (
-              // ===== MODO LÍNEAS =====
-              <div style={{ lineHeight: 1.9, fontSize: 16, fontFamily: "ui-serif, Georgia, serif" }}>
-                {lines.map((line, li) => {
-                  const lineTokens = tokenizePreserve(line);
-
-                  // filtro: si “solo misión”, removemos líneas que no contengan ninguna palabra de misión
-                  if (onlyMission) {
-                    const hasAny = lineTokens.some((t) => t.kind === "word" && missionSet.has(wordKey(t.value)));
-                    if (!hasAny) return null;
-                  }
-
-                  // filtro de búsqueda por línea
-                  const qRaw = search.trim();
-                  const q = ignoreAccents ? keyNoAccents(qRaw) : nfc(qRaw).toLowerCase();
-                  if (q) {
-                    const hasSearch = lineTokens.some((t) => t.kind === "word" && wordKey(t.value).includes(q));
-                    if (!hasSearch) return null;
-                  }
-
-                  return (
-                    <div key={li} style={{ marginBottom: 10 }}>
-                      <div className="small" style={{ marginBottom: 6 }}>
-                        Línea {li + 1}
+              <div style={{ maxHeight: 160, overflow: "auto", border: "1px solid var(--border)", borderRadius: 12, padding: 8 }}>
+                {searchResults.length === 0 ? (
+                  <div className="small">Sin resultados.</div>
+                ) : (
+                  searchResults.map((r, i) => (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "6px 4px" }}>
+                      <div className="small">
+                        <b>Hechos {r.ch}:{r.v}</b> — {r.t}
                       </div>
-
-                      <div>
-                        {lineTokens.map((t, ti) => {
-                          const idx = li * 100000 + ti; // idx único estable
-
-                          if (t.kind === "sep") return <span key={idx}>{t.value}</span>;
-
-                          const k = wordKey(t.value);
-                          const isMission = missionSet.has(k);
-                          const isFlash = lastClick?.idx === idx ? lastClick.result : null;
-
-                          const className =
-                            "token " +
-                            (isFlash === "ok" ? "token-ok" : isFlash === "bad" ? "token-bad" : "");
-
-                          return (
-                            <span
-                              key={idx}
-                              className={className}
-                              onClick={() => onWordClick(t.value, idx)}
-                              title={
-                                (isMission ? "Está en la misión" : "No está en la misión") +
-                                ` • Línea ${li + 1}`
-                              }
-                            >
-                              {t.value}
-                            </span>
-                          );
-                        })}
-                      </div>
+                      <button className="btn" onClick={() => { setChapter(r.ch); setTimeout(() => scrollToVerse(r.ch, r.v), 50); }}>
+                        Ir
+                      </button>
                     </div>
-                  );
-                })}
+                  ))
+                )}
               </div>
+            </div>
+          )}
+
+          <div style={{ marginTop: 12 }} className="scroller">
+            {mode === "na28" ? (
+              !acts ? (
+                <div className="small">
+                  {loadingActs ? "Cargando NA28..." : "Pulsa “Cargar NA28” (o espera el auto-load)."}
+                </div>
+              ) : (
+                <div style={{ lineHeight: 1.75, fontSize: 16, fontFamily: "ui-serif, Georgia, serif" }}>
+                  {(acts[String(chapter)] || []).map(({ v, t }) => {
+                    const id = `act-${chapter}-${v}`;
+
+                    // “solo misión” = ocultamos versos que no contengan palabras de misión
+                    if (onlyMission) {
+                      const tNorm = normalizeForCompare(t, ignoreAccents);
+                      let ok = false;
+                      for (const w of missionSet) {
+                        if (w && tNorm.includes(w)) { ok = true; break; }
+                      }
+                      if (!ok) return null;
+                    }
+
+                    const parts = tokenizePreserve(t);
+                    return (
+                      <div
+                        key={id}
+                        id={id}
+                        ref={(el) => verseRefs.current.set(id, el)}
+                        style={{
+                          padding: "8px 10px",
+                          borderBottom: "1px solid var(--border)"
+                        }}
+                      >
+                        <div style={{ display: "flex", gap: 10, alignItems: "baseline", marginBottom: 6 }}>
+                          <span className="badge" style={{ fontWeight: 800 }}>
+                            Hechos {chapter}:{v}
+                          </span>
+                        </div>
+
+                        <div>
+                          {parts.map((p, i) => {
+                            if (p.kind === "sep") return <span key={i}>{p.value}</span>;
+                            const clickKey = `${id}::${i}`;
+                            return <WordSpan key={i} word={p.value} clickKey={clickKey} />;
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )
             ) : (
-              // ===== MODO CONTINUO (original) =====
-              <div style={{ lineHeight: 1.75, fontSize: 16, fontFamily: "ui-serif, Georgia, serif" }}>
-                {filteredTokens.map((t, i) => {
-                  if (t.kind === "sep") return <span key={i}>{t.value}</span>;
-
-                  const k = wordKey(t.value);
-                  const isMission = missionSet.has(k);
-                  const isFlash = lastClick?.idx === i ? lastClick.result : null;
-
-                  const className =
-                    "token " + (isFlash === "ok" ? "token-ok" : isFlash === "bad" ? "token-bad" : "");
-
-                  return (
-                    <span
-                      key={i}
-                      className={className}
-                      onClick={() => onWordClick(t.value, i)}
-                      title={isMission ? "Está en la misión" : "No está en la misión"}
-                    >
-                      {t.value}
-                    </span>
-                  );
-                })}
-              </div>
+              loadingTxt ? (
+                <div className="small">Cargando TXT...</div>
+              ) : rawText.trim().length === 0 ? (
+                <div className="small">
+                  No hay texto. Verifica <code>public/acts_griego.txt</code> y pulsa “Cargar TXT”.
+                </div>
+              ) : (
+                <div style={{ lineHeight: 1.75, fontSize: 16, fontFamily: "ui-serif, Georgia, serif", whiteSpace: "pre-wrap" }}>
+                  {tokenizePreserve(rawText).map((p, i) => {
+                    if (p.kind === "sep") return <span key={i}>{p.value}</span>;
+                    const clickKey = `txt::${i}`;
+                    if (onlyMission) {
+                      const w = normalizeForCompare(p.value, ignoreAccents);
+                      if (!missionSet.has(w)) return null;
+                    }
+                    return <WordSpan key={i} word={p.value} clickKey={clickKey} />;
+                  })}
+                </div>
+              )
             )}
           </div>
 
           <div className="small" style={{ marginTop: 10 }}>
-            Próximo upgrade (cuando quieras): **capítulo/verso real**. Para eso necesitamos un texto con marcadores (ej: “1:1 …”),
-            o convertir tu TXT a un JSON de versos.
+            Tip: Para aprender más rápido: usa “solo misión” + click por verso, y al final revisa tu marcador hasta quedar 25/25.
           </div>
         </div>
       </div>
